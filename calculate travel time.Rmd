@@ -1,0 +1,168 @@
+---
+title: "openrouteservice"
+output: html_document
+date: "2026-04-09"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r cars}
+summary(cars)
+```
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r pressure, echo=FALSE}
+plot(pressure)
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+
+```{r}
+library(tidyverse)
+library(openrouteservice)
+library(sf)
+library(httr)
+
+
+# 1. change to the new API website
+options(
+  openrouteservice.url = "https://api.heigit.org/openrouteservice"
+)
+
+message(
+  "Current API website：",
+  getOption("openrouteservice.url")
+)
+
+
+# 2. network setting
+options(timeout = 60)
+
+# 3. Key package
+
+api_keys <- c(
+  "XXX",
+  "XXX"
+  #, can add more
+)
+
+current_key_idx <- 1  # start from the first key
+checkpoint_file <- "maternal_sensitivity_checkpoint.rds" # history file
+
+# 4. read history file
+if (file.exists(checkpoint_file)) {
+  saved_data <- readRDS(checkpoint_file)
+  message(paste("already read", length(saved_data)))
+} else {
+  saved_data <- list()
+}
+
+total_rows <- nrow(maternal_sensitivity)
+
+# 5. get isochornes for each point
+
+for (i in 1:total_rows) {
+  
+  current_id <- as.character(i)
+  
+  # if the point has been processed, just skip
+  if (current_id %in% names(saved_data) && !is.null(saved_data[[current_id]])) {
+    next
+  }
+  
+  lon <- maternal_sensitivity$lon[i]
+  lat <- maternal_sensitivity$lat[i]
+  if (is.na(lon) || is.na(lat)) next
+  
+  success <- FALSE
+  
+  # time limit
+  Sys.sleep(4)
+  
+  # if fail, check if there is other key
+  while (!success && current_key_idx <= length(api_keys)) {
+    
+    active_token <- api_keys[current_key_idx]
+    
+    res <- tryCatch({
+      ors_isochrones(
+        locations = list(c(lon, lat)),
+        profile = "driving-car",
+        range_type = "time",
+        range = 7200, # change here for hospitals with different thresholds, 30/60/120 mins
+        units = "seconds",
+        output = "sf",
+        api_key = active_token
+      )
+    }, error = function(e) {
+      err_msg <- e$message
+      message(paste("point", i, "use Key", current_key_idx, "fail:", err_msg))
+      
+      # switch key, if words "403 / Quota / Rate limit" return
+      if (str_detect(err_msg, "403") || str_detect(err_msg, "Quota") || str_detect(err_msg, "rate limit")) {
+        message(paste("Key", current_key_idx, "is out of quota, switch to next key"))
+        # key + 1
+        current_key_idx <<- current_key_idx + 1
+      } else {
+        # other problem, cease project and check
+        return(NULL)
+      }
+      return(NULL)
+    })
+    
+    # if success
+    if (!is.null(res)) {
+      success <- TRUE
+      
+      # merge attributes
+      point_attr <- as.data.frame(maternal_sensitivity[i, ])
+      point_sf <- bind_cols(res, point_attr)
+      
+      saved_data[[current_id]] <- point_sf
+      saveRDS(saved_data, checkpoint_file)
+      
+      message(paste0("success[Key ", current_key_idx, "] finish ", i, " / ", total_rows, " points (overall: ", length(saved_data), ")"))
+    }
+  }
+  
+  # if key were all used up
+  if (current_key_idx > length(api_keys)) {
+    message("all keys were used up, project has been ceased")
+    break
+  }
+}
+
+
+# 6. merge all data
+if (length(saved_data) > 0) {
+  maternal_sensitivity_final <- do.call(rbind, saved_data)
+  message(paste("finish", nrow(maternal_sensitivity_final), "120km isochornes"))
+}
+
+# 7. drop list
+maternal_sensitivity_final <- maternal_sensitivity_final %>%
+  select(where(~ !is.list(.x) | inherits(.x, "sfc")))
+
+# 8. export shp
+st_write(maternal_sensitivity_final, 
+         dsn = "maternal_sensitivity_final.shp", 
+         driver = "ESRI Shapefile",
+         layer_options = "ENCODING=UTF-8",
+         delete_dsn = TRUE)
+```
+
+
+
+
+
